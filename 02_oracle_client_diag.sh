@@ -3,10 +3,10 @@ set -euo pipefail
 
 ###############################################################################
 # USO:
-# ./02_oracle_client_diag.sh <DEST_HOST> <DEST_ORATCP_PORT> <DB_HOST> <DB_PORT> <TNS_ALIAS> <DBLINK_NAME> <IFACE> <CAPTURE_SECONDS>
+# ./02_oracle_client_diag.sh <DEST_HOST> <DEST_ORATCP_PORT> <DB_HOST> <DB_PORT> <TNS_ALIAS> <DBLINK_NAME> <DB_VERSION> <IFACE> <CAPTURE_SECONDS>
 #
 # EJEMPLO:
-# ./02_oracle_client_diag.sh 10.10.10.20 4711 10.10.10.20 1521 EXPLDB MI_DBLINK any 90
+# ./02_oracle_client_diag.sh 10.10.10.20 4711 10.10.10.20 1521 EXPLDB MI_DBLINK 19c any 90
 #
 # PARAMETROS:
 # DEST_HOST         = host donde corre el servidor oratcptest
@@ -15,6 +15,7 @@ set -euo pipefail
 # DB_PORT           = puerto Oracle real (ej: 1521)
 # TNS_ALIAS         = alias TNS que funciona en este host
 # DBLINK_NAME       = nombre del DBLink a probar desde SQL*Plus
+# DB_VERSION        = version de la BD remota: 10g | 11g | 19c
 # IFACE             = interfaz para tcpdump (ej: any o eth0)
 # CAPTURE_SECONDS   = segundos de captura tcpdump
 ###############################################################################
@@ -25,15 +26,26 @@ DB_HOST="${3:-}"
 DB_PORT="${4:-1521}"
 TNS_ALIAS="${5:-}"
 DBLINK_NAME="${6:-}"
-IFACE="${7:-any}"
-CAPTURE_SECONDS="${8:-90}"
+DB_VERSION="${7:-19c}"
+IFACE="${8:-any}"
+CAPTURE_SECONDS="${9:-90}"
 JAR="./oratcptest.jar"
 
 if [[ -z "$DEST_HOST" || -z "$DB_HOST" || -z "$TNS_ALIAS" || -z "$DBLINK_NAME" ]]; then
   echo "Uso:"
-  echo "./02_oracle_client_diag.sh <DEST_HOST> <DEST_ORATCP_PORT> <DB_HOST> <DB_PORT> <TNS_ALIAS> <DBLINK_NAME> <IFACE> <CAPTURE_SECONDS>"
+  echo "./02_oracle_client_diag.sh <DEST_HOST> <DEST_ORATCP_PORT> <DB_HOST> <DB_PORT> <TNS_ALIAS> <DBLINK_NAME> <DB_VERSION> <IFACE> <CAPTURE_SECONDS>"
+  echo
+  echo "DB_VERSION: 10g | 11g | 19c  (version de la BD REMOTA del DBLink)"
   exit 1
 fi
+
+case "${DB_VERSION,,}" in
+  10g|11g|19c) ;;
+  *)
+    echo "ERROR: DB_VERSION debe ser 10g, 11g o 19c (recibido: '$DB_VERSION')"
+    exit 1
+    ;;
+esac
 
 if [[ ! -f "$JAR" ]]; then
   echo "ERROR: falta ./oratcptest.jar"
@@ -144,9 +156,10 @@ run_cmd "22_oratcptest_small_payload" java -jar "$JAR" "$DEST_HOST" -port="$DEST
 echo "[INFO] ORATCPTEST payload mediano"
 run_cmd "23_oratcptest_medium_payload" java -jar "$JAR" "$DEST_HOST" -port="$DEST_ORATCP_PORT" -mode=async -length=65536 -duration=20s -interval=5s
 
-echo "[INFO] DBLINK test via SQL*Plus"
+echo "[INFO] DBLINK test via SQL*Plus (DB_VERSION=${DB_VERSION})"
 cat > "${OUTDIR}/run_dblink_test.sql" <<SQL
-define DBLINK_NAME='${DBLINK_NAME}'
+define DB_VERSION=${DB_VERSION}
+define DBLINK_NAME=${DBLINK_NAME}
 @03_dblink_latency_test.sql
 SQL
 
@@ -166,6 +179,7 @@ stop_tcpdump "${OUTDIR}/tcpdump_db.pid"
   echo "Host Oracle      : $DB_HOST:$DB_PORT"
   echo "TNS alias        : $TNS_ALIAS"
   echo "DBLink           : $DBLINK_NAME"
+  echo "DB version       : $DB_VERSION"
   echo
 
   echo "[PING]"
