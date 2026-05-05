@@ -169,7 +169,7 @@ chmod +x *.sh
 
 ---
 
-# Procedimiento ejecutado por Oracle
+# Procedimiento a ejecutar
 
 A continuación se documenta cada paso del diagnóstico: el comando ejecutado y la salida obtenida como referencia.
 
