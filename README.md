@@ -30,7 +30,7 @@ El kit valida desde el host Linux/Oracle cliente:
 
 En el host cliente Oracle:
 
-- Java y `oratcptest.jar`;
+- Java y `oratcptest.jar` disponible localmente;
 - `tcpdump`, `ping`, `traceroute` o `tracepath`, `mtr`, `nc` o `ncat`, `ip`, `ss`, `awk`;
 - Oracle client con `sqlplus` y `tnsping`;
 - permisos para ejecutar `tcpdump` con `sudo` o como root;
@@ -49,6 +49,119 @@ Ejecuta:
 ```bash
 ./00_prereq_check.sh
 ```
+
+## Obtencion de `oratcptest.jar`
+
+`oratcptest.jar` es una herramienta de Oracle Support y no se incluye en este repositorio. El equipo on-prem o DBA debe descargarla desde My Oracle Support con una cuenta autorizada.
+
+Pasos:
+
+1. Entrar a [My Oracle Support](https://support.oracle.com/).
+2. Buscar el documento `Doc ID 2064368.1`: `Assessing and Tuning Network Performance for Data Guard and RMAN`.
+3. Descargar el adjunto `oratcptest.jar` desde ese documento.
+4. Copiar el archivo al directorio del kit en el host cliente Oracle.
+5. Copiar el mismo archivo al directorio del kit en cada host destino donde se ejecutara `01_oratcp_server.sh`.
+6. Validar que Java puede abrir el jar:
+
+```bash
+java -jar ./oratcptest.jar -help
+```
+
+Ubicacion esperada por defecto:
+
+```text
+/ruta/del/kit/oratcptest.jar
+```
+
+Si el archivo queda en otra ruta, usa estas opciones:
+
+```bash
+ORATCPTEST_JAR=/opt/oracle/tools/oratcptest.jar ./06_run_targets.sh targets.csv diag_paths_HAB
+./01_oratcp_server.sh 4711 /opt/oracle/tools/oratcptest.jar ./oratcp_server_logs
+```
+
+Recomendaciones:
+
+- usar la misma version de `oratcptest.jar` en cliente y destinos;
+- no subir `oratcptest.jar` al repositorio Git;
+- si el cliente tiene un repositorio interno de binarios aprobado, guardar alli una copia controlada y distribuirla desde ese punto;
+- confirmar que el firewall permite TCP hacia el puerto configurado para `oratcptest`, normalmente `4711`.
+
+## Requisitos para el equipo on-prem
+
+Antes de ejecutar la recoleccion, el equipo on-prem debe confirmar conectividad, permisos de host y permisos Oracle. Si alguno de estos puntos falta, el kit puede seguir generando archivos, pero la comparacion quedara incompleta o no podra probar el path real.
+
+### Flujos de red y puertos
+
+Permitir estos flujos desde el host cliente donde se ejecuta `06_run_targets.sh`:
+
+| Origen | Destino | Protocolo/puerto | Para que se usa |
+|---|---|---|---|
+| Cliente Oracle | `dest_host` de cada target `SCL`/`VLP` | TCP `dest_oratcp_port`, normalmente `4711` | Benchmark `oratcptest`. |
+| Cliente Oracle | `db_host` de cada target `SCL`/`VLP` | TCP `db_port`, normalmente `1521` | `nc/ncat`, `tnsping`, `sqlplus`, pcaps de trafico Oracle. |
+| Cliente Oracle | `db_host` y `dest_host` | ICMP echo request/reply | `ping` y checks MTU con DF. |
+| Cliente Oracle | Saltos intermedios de red | ICMP time exceeded / unreachable | Evidencia de `traceroute`, `tracepath` y `mtr`. |
+| Cliente Oracle | `db_host` | TCP `db_port` con TTL variable | `traceroute -T` y `mtr --tcp`. |
+| Base de datos origen del DBLink | Base de datos remota del DBLink | TCP listener remoto, normalmente `1521` | Ejecucion real de `select ... from dual@DBLINK`. |
+
+Permitir estos flujos hacia cada host donde se levanta `01_oratcp_server.sh`:
+
+- entrada TCP al puerto `dest_oratcp_port`, normalmente `4711`, desde el host cliente;
+- salida de respuesta TCP hacia el host cliente;
+- acceso administrativo para copiar el kit, copiar `oratcptest.jar` e iniciar el proceso Java.
+
+Si el ambiente bloquea ICMP, el kit aun puede medir TCP/Oracle, pero no podra validar perdida, MTU ni path IP con la misma claridad. Si `tracepath` se usa como fallback, la red debe permitir las respuestas ICMP generadas por los saltos intermedios.
+
+### Permisos Linux
+
+En el host cliente:
+
+- usuario con permiso de ejecucion sobre los scripts del kit;
+- permiso para ejecutar `tcpdump` como root o via `sudo`;
+- si se usa `sudo`, idealmente permitir sin password estos comandos para evitar prompts durante la recoleccion: `tcpdump` y `kill`;
+- permiso de escritura en el directorio de salida, por ejemplo `diag_paths_HAB`;
+- `PATH` con Java, Oracle client, `sqlplus`, `tnsping`, `ip`, `ss`, `ping`, `mtr`, `traceroute` o `tracepath`, `nc` o `ncat`;
+- espacio en disco suficiente para pcaps. Como referencia, reservar al menos 2 GB por ventana de captura si hay trafico alto o se usa `capture_seconds` largo.
+
+Ejemplo de politica `sudoers` ajustada por el administrador Linux, usando las rutas reales del host:
+
+```text
+oracle_diag_user ALL=(root) NOPASSWD: /usr/sbin/tcpdump, /usr/bin/kill, /bin/kill
+```
+
+Alternativa posible, si la politica local lo permite: otorgar capabilities a `tcpdump` con `setcap cap_net_raw,cap_net_admin=eip /usr/sbin/tcpdump`. El equipo Linux debe decidir entre `sudo` y capabilities segun sus controles internos.
+
+En cada host destino de `oratcptest`:
+
+- usuario con permiso para ejecutar Java;
+- permiso para abrir el puerto `dest_oratcp_port`;
+- firewall local liberado para ese puerto;
+- directorio de logs escribible para `./oratcp_server_logs`;
+- reloj sincronizado con NTP/chrony o evidencia clara de offset.
+
+### Permisos Oracle y datos de conexion
+
+El equipo DBA debe preparar:
+
+- alias TNS funcional para cada target, por ejemplo `EXPLDB_SCL` y `EXPLDB_VLP`;
+- autenticacion valida para `sqlplus -L /@TNS_ALIAS`, ya sea wallet, external authentication o el mecanismo local aprobado;
+- DBLink existente y valido para cada path declarado en `targets.csv`;
+- usuario con permiso para ejecutar `select systimestamp from dual` y `select systimestamp from dual@DBLINK`;
+- acceso de lectura a vistas dinamicas usadas por el diagnostico: `v$session`, `v$mystat`, `v$sesstat`, `v$statname`, `v$session_event` y `v$session_longops`;
+- opcional para Oracle 19c: acceso a `v$sql_monitor` solo si existe licencia y aprobacion para Oracle Tuning Pack.
+
+El DBLink se ejecuta desde la base de datos origen, no desde el shell Linux directamente. Por eso el equipo on-prem debe confirmar tambien que el servidor de base de datos origen puede abrir conexion TCP hacia el listener de la base remota del DBLink.
+
+### Coordinacion durante failover
+
+Para una prueba de switchover o link-down:
+
+- definir hora exacta de inicio y fin del evento;
+- confirmar que cliente, servidores DB y equipos de red tienen relojes sincronizados;
+- iniciar `05_failover_watch.sh` antes del cambio;
+- mantener `tcpdump` habilitado durante la ventana;
+- registrar quien ejecuta el cambio de red y el timestamp exacto;
+- evitar cambios paralelos no relacionados durante la medicion.
 
 ## Configuracion de targets
 
