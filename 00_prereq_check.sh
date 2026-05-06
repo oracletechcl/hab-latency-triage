@@ -64,6 +64,29 @@ need_cmd tshark \
           o bien:  sudo apt-get install -y tshark  (Debian/Ubuntu)
           Nota: es opcional; solo se usa en 04_analyze_pcap.sh"
 
+need_cmd ip \
+  "sudo yum install -y iproute       (RHEL/OEL/CentOS)
+          o bien:  sudo apt-get install -y iproute2  (Debian/Ubuntu)"
+
+need_cmd ss \
+  "sudo yum install -y iproute       (RHEL/OEL/CentOS)
+          o bien:  sudo apt-get install -y iproute2  (Debian/Ubuntu)"
+
+need_cmd awk \
+  "sudo yum install -y gawk          (RHEL/OEL/CentOS)
+          o bien:  sudo apt-get install -y gawk  (Debian/Ubuntu)"
+
+need_cmd timedatectl \
+  "Normalmente viene con systemd. Si no existe, captura al menos date -Ins."
+
+need_cmd chronyc \
+  "Opcional para evidencia NTP/chrony: sudo yum install -y chrony
+          o bien:  sudo apt-get install -y chrony"
+
+need_cmd ntpq \
+  "Opcional para evidencia NTP clasica: sudo yum install -y ntp
+          o bien:  sudo apt-get install -y ntpsec-ntpdate ntpsec"
+
 echo
 echo "=== JAVA VERSION ==="
 java -version 2>&1 || echo "[AVISO] java no disponible; instálalo antes de continuar."

@@ -1,497 +1,209 @@
-# Oracle Network and DBLink Diagnostics
+# Oracle Network and DBLink HA Path Diagnostics
 
-Este documento describe el procedimiento de diagnóstico de red y DBLink ejecutado por Oracle en el ambiente indicado. Su objetivo es dejar evidencia técnica suficiente para responder:
+Kit de diagnostico para validar comportamiento por camino en escenarios Habitat / Cirion / OCI. El flujo actual ejecuta el mismo set de pruebas contra multiples targets, por ejemplo Santiago (`SCL`) y Valparaiso (`VLP`), guarda evidencia separada por path y genera una comparacion consolidada para revision tecnica.
 
-> ¿El problema de rendimiento está en la red IP, en el transporte Oracle/TCP, en el DBLink, o en una combinación de todo?
+El kit valida desde el host Linux/Oracle cliente:
 
-Las pruebas cubren cuatro capas:
+- latencia IP con `ping`, `traceroute` o `tracepath`, `mtr` y checks rapidos de MTU;
+- transporte Oracle/TCP con `oratcptest`;
+- conectividad Oracle con `nc`, `tnsping` y `sqlplus`;
+- latencia funcional DBLink con metricas acotadas a la sesion SQL*Plus bajo prueba;
+- evidencia efectiva de path con `ip route get`, `ip rule show`, `ip addr`, `ip neigh show`, `ss -ti` y contadores de interfaz antes y despues de cada test;
+- capturas `tcpdump` separadas para trafico de aplicacion y eventos de failover/conectividad;
+- watch continuo de failover para medir cortes, recuperacion y errores con timestamps;
+- evidencia de sincronizacion de tiempo en cliente y servidor.
 
-1. **Latencia de red IP** — ping, traceroute, mtr
-2. **Transporte Oracle/TCP** — `oratcptest` (latencia y throughput)
-3. **Latencia funcional de DBLink** — roundtrips reales medidos desde SQL*Plus
-4. **Evidencia TCP** — capturas `tcpdump` analizables en Wireshark
+## Archivos del kit
 
----
-
-# Archivos del kit de diagnóstico
-
-El kit utilizado para ejecutar las pruebas contiene los siguientes archivos:
-
-| Archivo | Rol |
+| Archivo | Uso actual |
 |---|---|
-| `00_prereq_check.sh` | Verifica prerequisitos del ambiente |
-| `01_oratcp_server.sh` | Levanta el servidor `oratcptest` en el host destino |
-| `02_oracle_client_diag.sh` | Orquesta todas las pruebas desde el host cliente |
-| `03_dblink_latency_test.sql` | Mide latencia funcional del DBLink desde SQL*Plus |
-| `04_analyze_pcap.sh` | Analiza las capturas `.pcap` en el host de prueba |
-| `oratcptest.jar` | Utilitario oficial Oracle (MOS Doc ID 2064368.1) |
+| `targets.csv.example` | Plantilla para declarar los targets/caminos, por ejemplo `SCL` y `VLP`. |
+| `06_run_targets.sh` | Wrapper principal. Ejecuta todos los targets del CSV y genera `comparison.csv` y `comparison.md`. Tambien puede refrescar solo el reporte con `--report-only`. |
+| `02_oracle_client_diag.sh` | Ejecuta las pruebas de un target individual. Lo invoca `06_run_targets.sh`. |
+| `03_dblink_latency_test.sql` | Benchmark DBLink con `SID/SERIAL#`, `DBMS_APPLICATION_INFO`, waits y `v$sesstat` acotados a la sesion del test. |
+| `05_failover_watch.sh` | Watch continuo para switchover/link-down: `tnsping`, `sqlplus`, `dual@DBLINK` y `nc/ncat -z`. |
+| `04_analyze_pcap.sh` | Analisis de pcaps en modo `app`, `failover` o `all`. |
+| `01_oratcp_server.sh` | Levanta el servidor `oratcptest` en cada destino y registra evidencia de tiempo. |
+| `00_prereq_check.sh` | Revisa herramientas necesarias y opcionales. |
 
----
+## Requisitos
 
-# Detalle de los scripts
+En el host cliente Oracle:
 
-## `00_prereq_check.sh`
-Valida que el ambiente de prueba cuente con:
-- Java
-- tcpdump
-- ping
-- traceroute / tracepath
-- mtr
-- nc
-- sqlplus
-- tnsping
-- tshark
-- `oratcptest.jar`
+- Java y `oratcptest.jar`;
+- `tcpdump`, `ping`, `traceroute` o `tracepath`, `mtr`, `nc` o `ncat`, `ip`, `ss`, `awk`;
+- Oracle client con `sqlplus` y `tnsping`;
+- permisos para ejecutar `tcpdump` con `sudo` o como root;
+- opcional: `tshark` para retransmisiones, RTT y analisis enriquecido;
+- opcional: `chronyc`, `ntpq` o `timedatectl` para evidencia completa de tiempo.
 
-## `01_oratcp_server.sh`
-Levanta el servidor de `oratcptest` en el host destino (receptor de las pruebas de transporte Oracle/TCP).
+En cada host destino usado por `oratcptest`:
 
-## `02_oracle_client_diag.sh`
-Orquesta todas las pruebas desde el host cliente Oracle:
-- ping
-- traceroute
-- mtr
-- MTU check
-- conectividad al listener Oracle
-- tnsping
-- sqlplus
-- pruebas `oratcptest`
-- prueba funcional de DBLink (llama a `03_dblink_latency_test.sql`)
-- captura tcpdump
+- Java;
+- `oratcptest.jar`;
+- puerto permitido para el servidor `oratcptest`, normalmente `4711`;
+- reloj sincronizado o al menos evidencia de `date -Ins`.
 
-Recibe `DB_VERSION` como parámetro y lo pasa automáticamente al script SQL.
-
-## `03_dblink_latency_test.sql`
-Mide la latencia funcional del DBLink. Compatible con **Oracle 10g, 11g y 19c**.
-Al ejecutarlo, SQL*Plus pide dos valores:
-
-| Variable | Valores aceptados | Descripción |
-|---|---|---|
-| `DB_VERSION` | `10g` \| `11g` \| `19c` | Versión de la BD remota (destino del DBLink) |
-| `DBLINK_NAME` | nombre del DBLink | Ej.: `MY_DBLINK` |
-
-Secciones que ejecuta:
-
-| # | Qué mide | Versiones |
-|---|---|---|
-| 1 | Test remoto simple | todas |
-| 2 | 10 llamadas remotas secuenciales | todas |
-| 3 | 100 llamadas remotas secuenciales | todas |
-| 4 | Comparación local vs remoto 100 llamadas | todas |
-| 5 | Waits de sesión relacionados con DBLink/SQL\*Net | todas |
-| 6 | Top 20 SQL con referencia a DBLink por elapsed_time | todas |
-| 7 | `v$session_longops` — operaciones largas activas | todas |
-| 8 | `v$sesstat` — bytes y roundtrips por DBLink | 11g+ |
-| 9 | Real-Time SQL Monitoring (`v$sql_monitor`) | 19c (requiere Tuning Pack) |
-
-## `04_analyze_pcap.sh`
-Analiza rápidamente los archivos `.pcap`:
-- SYN / FIN / RST
-- retransmisiones
-- RTT ACK
-- zero window
-- conversaciones TCP
-
----
-
-# Objetivo de las pruebas
-
-Las pruebas están diseñadas para separar el problema en capas:
-
-## Capa 1: Red IP
-Esto responde:
-- ¿hay latencia base alta?
-- ¿hay pérdida?
-- ¿hay jitter?
-- ¿hay una ruta rara o indirecta?
-
-## Capa 2: Transporte Oracle/TCP
-Esto responde:
-- ¿el canal Oracle/TCP está sano?
-- ¿`oratcptest` muestra diferencia real entre rutas?
-- ¿el problema es conectividad o desempeño del transporte?
-
-## Capa 3: DBLink
-Esto responde:
-- ¿el DBLink es funcionalmente lento?
-- ¿la lentitud se acumula por roundtrips?
-- ¿el problema viene del patrón remoto del proceso?
-
-## Capa 4: TCP real
-Esto responde:
-- ¿hay retransmisiones?
-- ¿hay pausas entre request/response?
-- ¿hay zero windows?
-- ¿el handshake está lento?
-
----
-
-# Requisitos del ambiente de prueba
-
-## En ambos hosts (cliente y destino)
-
-- Linux con bash
-- Java instalado
-- `tcpdump`
-- `ping`
-- `oratcptest.jar`
-
-## En el host cliente Oracle además
-- `sqlplus`
-- `tnsping`
-
-## Opcionales (mejoran la evidencia)
-- `mtr`
-- `traceroute`
-- `tshark`
-
----
-
-# Preparación del ambiente
-
-## 0. Obtención de `oratcptest.jar`
-
-`oratcptest.jar` es un utilitario oficial de Oracle que no se redistribuye. Oracle lo obtuvo desde My Oracle Support (MOS):
-
-- Documento **Doc ID 2064368.1**: _"Assessing and Tuning Network Performance for Data Guard and RMAN"_.
-
----
-
-## 1. Directorio de trabajo
-
-Se creó un directorio de trabajo y se copiaron todos los archivos del kit:
-
-```bash
-mkdir -p ~/oracle_net_diag
-cd ~/oracle_net_diag
-chmod +x *.sh
-```
-
----
-
-# Procedimiento a ejecutar
-
-A continuación se documenta cada paso del diagnóstico: el comando ejecutado y la salida obtenida como referencia.
-
-## Paso 1 — Verificación de prerequisitos
-
-Se verificó que el ambiente contara con todas las herramientas necesarias:
+Ejecuta:
 
 ```bash
 ./00_prereq_check.sh
 ```
 
-**Salida de referencia — ambiente completo:**
+## Configuracion de targets
 
-```
-=== PREREQ CHECK ===
-[OK]      java
-[OK]      tcpdump
-[OK]      ping
-[OK]      traceroute
-[OK]      tracepath
-[OK]      mtr
-[OK]      nc
-[OK]      sqlplus
-[OK]      tnsping
-[OK]      tshark
-
-=== JAVA VERSION ===
-openjdk version "11.0.22" 2024-01-16
-OpenJDK Runtime Environment ...
-
-=== ORATCPTEST CHECK ===
-[OK]      ./oratcptest.jar existe
-Probando help...
-Usage: oratcptest [<host>] [options]
-  ...
-
-=== FIN ===
-```
-
-**Salida de referencia — prerequisitos faltantes y cómo se resolvieron:**
-
-```
-=== PREREQ CHECK ===
-[OK]      java
-[OK]      tcpdump
-[OK]      ping
-[MISSING] traceroute
-          Como resolver: sudo yum install -y traceroute    (RHEL/OEL/CentOS)
-          o bien:  sudo apt-get install -y traceroute  (Debian/Ubuntu)
-          Alternativa si no está disponible: usa 'tracepath' (incluido en iputils)
-
-[MISSING] mtr
-          Como resolver: sudo yum install -y mtr           (RHEL/OEL/CentOS)
-          o bien:  sudo apt-get install -y mtr-tiny  (Debian/Ubuntu)
-...
-
-=== ORATCPTEST CHECK ===
-[MISSING] ./oratcptest.jar
-          Como resolver:
-          1. Entra a https://support.oracle.com con una cuenta MOS.
-          2. Busca el Doc ID 2064368.1 ...
-          4. Copia el archivo a este mismo directorio: cp /ruta/a/oratcptest.jar /home/user/oracle_net_diag/
-
-=== FIN ===
-```
-
-> Los prerequisitos marcados `[MISSING]` se resolvieron antes de continuar. `tshark` es opcional.
-
----
-
-## Paso 2 — Inicio del servidor oratcptest en el host destino
-
-Se levantó el servidor `oratcptest` en el host destino para recibir las pruebas de transporte Oracle/TCP:
+Crea el archivo de targets desde la plantilla:
 
 ```bash
-# Ejecutado en el HOST DESTINO:
-./01_oratcp_server.sh
+cp targets.csv.example targets.csv
 ```
 
-**Salida al iniciar el servidor:**
-Puerto : 4711
-Jar    : ./oratcptest.jar
-Log    : ./oratcp_server_logs/oratcp_server_20260505_103000.log
-==================================================
-[INFO] Verificando ayuda del jar
-[INFO] Iniciando servidor
-[INFO] Déjalo corriendo. No cierres esta terminal.
-[INFO] Para detenerlo: Ctrl+C
+Edita `targets.csv` con los valores reales:
 
-oratcptest server listening on port 4711
+```csv
+target_name,dest_host,dest_oratcp_port,db_host,db_port,tns_alias,dblink_name,db_version,iface,capture_seconds,capture_mode
+SCL,10.10.10.20,4711,10.10.10.20,1521,EXPLDB_SCL,MI_DBLINK_SCL,19c,any,90,both
+VLP,10.20.10.20,4711,10.20.10.20,1521,EXPLDB_VLP,MI_DBLINK_VLP,19c,any,90,both
 ```
 
-> El servidor se mantuvo activo en sesión `screen`/`tmux` durante toda la prueba. El log quedó registrado en `./oratcp_server_logs/`.
+Columnas:
 
----
-
-## Paso 3 — Diagnóstico completo desde el host cliente
-
-Desde el host cliente Oracle se ejecutó el script principal con los parámetros del ambiente:
-
-```bash
-./02_oracle_client_diag.sh \
-  <DEST_HOST> \
-  <DEST_ORATCP_PORT> \
-  <DB_HOST> \
-  <DB_PORT> \
-  <TNS_ALIAS> \
-  <DBLINK_NAME> \
-  <DB_VERSION> \
-  <IFACE> \
-  <CAPTURE_SECONDS>
-```
-
-| Parámetro | Descripción | Ejemplo |
-|---|---|---|
-| `DEST_HOST` | Host donde corre oratcptest | `10.10.10.20` |
-| `DEST_ORATCP_PORT` | Puerto oratcptest | `4711` |
-| `DB_HOST` | Host del listener Oracle | `10.10.10.20` |
-| `DB_PORT` | Puerto Oracle | `1521` |
-| `TNS_ALIAS` | Alias TNS local | `EXPLDB` |
-| `DBLINK_NAME` | Nombre del DBLink | `MI_DBLINK` |
-| `DB_VERSION` | Versión de la BD **remota** del DBLink | `10g` \| `11g` \| `19c` |
-| `IFACE` | Interfaz tcpdump | `any` \| `eth0` |
-| `CAPTURE_SECONDS` | Segundos extra de captura tcpdump | `90` |
-
-Ejemplo de la invocación realizada:
-
-```bash
-./02_oracle_client_diag.sh 10.10.10.20 4711 10.10.10.20 1521 EXPLDB MI_DBLINK 19c any 90
-```
-
-**Salida en pantalla durante la ejecución:**
-
-```
-[INFO] Output: diag_myhost_20260505_103015
-[INFO] Iniciando capturas
-[INFO] Iniciando tcpdump -> diag_myhost_.../oratcptest_10.10.10.20_4711.pcap
-[INFO] Iniciando tcpdump -> diag_myhost_.../oracle_10.10.10.20_1521.pcap
-[INFO] Pruebas de red base
-[INFO] MTU quick check
-[INFO] Listener connectivity
-[INFO] TNSPING
-[INFO] SQL*Plus conexión simple
-[INFO] ORATCPTEST sync
-[INFO] ORATCPTEST async
-[INFO] ORATCPTEST payload chico
-[INFO] ORATCPTEST payload mediano
-[INFO] DBLINK test via SQL*Plus (DB_VERSION=19c)
-[INFO] Esperando ventana extra de captura: 90s
-[INFO] Deteniendo capturas
-
-[OK] Diagnóstico completo en: diag_myhost_20260505_103015
-[OK] Lee primero: diag_myhost_20260505_103015/SUMMARY.txt
-```
-
-Cada prueba quedó registrada en su propio archivo `.txt` dentro del directorio de resultados:
-
-```
-diag_myhost_20260505_103015/
-├── SUMMARY.txt                  <- empieza aquí
-├── 01_hostname.txt
-├── 02_uname.txt
-├── 03_ip_addr.txt
-├── 04_ip_route.txt
-├── 05_java_version.txt
-├── 06_oratcptest_help.txt
-├── 10_ping_dbhost.txt
-├── 11_traceroute_db_tcp.txt
-├── 12_mtr_db_tcp.txt
-├── 13_mtu_1472.txt
-├── 14_mtu_1400.txt
-├── 15_nc_db_port.txt
-├── 16_tnsping.txt
-├── 17_sqlplus_connect.txt
-├── 20_oratcptest_sync.txt
-├── 21_oratcptest_async.txt
-├── 22_oratcptest_small_payload.txt
-├── 23_oratcptest_medium_payload.txt
-├── 30_dblink_test.txt
-├── oratcptest_10.10.10.20_4711.pcap
-└── oracle_10.10.10.20_1521.pcap
-```
-
-**Contenido típico de `SUMMARY.txt`:**
-
-```
-================ SUMMARY ================
-Host origen      : myhost
-Host oratcptest  : 10.10.10.20:4711
-Host Oracle      : 10.10.10.20:1521
-TNS alias        : EXPLDB
-DBLink           : MI_DBLINK
-DB version       : 19c
-
-[PING]
-20 packets transmitted, 20 received, 0% packet loss
-rtt min/avg/max/mdev = 0.412/0.534/1.102/0.148 ms
-
-[TNSPING]
-Attempting to contact (DESCRIPTION= ...)
-OK (10 msec)
-
-[ORATCPTEST]
-20_oratcptest_sync.txt:  Avg. latency:   0.540 ms
-21_oratcptest_async.txt: Avg. throughput: 945.3 Mbps
-22_oratcptest_small_payload.txt: ...
-23_oratcptest_medium_payload.txt: ...
-
-[PCAPS]
--rw-r--r-- 1 opc opc 1.2M May  5 10:31 oratcptest_10.10.10.20_4711.pcap
--rw-r--r-- 1 opc opc 4.5M May  5 10:31 oracle_10.10.10.20_1521.pcap
-```
-
----
-
-## Paso 4 — Test SQL de DBLink
-
-Se ejecutó el script SQL de latencia de DBLink directamente para obtener evidencia detallada de la capa funcional:
-
-```bash
-sqlplus /@<TNS_ALIAS> @03_dblink_latency_test.sql
-# SQL*Plus solicita:
-#   Enter value for DB_VERSION:  19c
-#   Enter value for DBLINK_NAME: MI_DBLINK
-```
-
-Para evitar prompts interactivos:
-
-```bash
-echo "define DB_VERSION=19c
-define DBLINK_NAME=MI_DBLINK
-@03_dblink_latency_test.sql" | sqlplus /@<TNS_ALIAS>
-```
-
-**Salida obtenida:**
-
-```
-==================================================
-DBLINK LATENCY TEST
-VERSION = 19c
-DBLINK  = MI_DBLINK
-==================================================
-
-LOCAL_TS
------------------------------------
-2026-05-05 10:30:15.123 -06:00
-
-[1] Test remoto simple
-
-REMOTE_TS
------------------------------------
-2026-05-05 16:30:15.456 +00:00
-
-[2] 10 llamadas remotas secuenciales
-10 llamadas remotas total: +000000000 00:00:00.534218000
-
-[3] 100 llamadas remotas secuenciales
-100 llamadas remotas total: +000000000 00:00:05.218743000
-
-[4] Comparación local vs remoto - 100 llamadas
-100 llamadas locales total:  +000000000 00:00:00.041200000
-100 llamadas remotas total: +000000000 00:00:05.231100000
-
-[5] Vista de waits relacionados con DBLink / SQL*Net
-       SID    SERIAL# USERNAME   EVENT                                              SECONDS_IN_WAIT STATE
----------- ---------- ---------- -------------------------------------------------- --------------- -------
-       143       4821 MYAPP      SQL*Net message from dblink                                      0 WAITING
-
-[6] SQL con referencia explicita a DBLink (top 20 por elapsed_time)
- SQL_ID          EXECUTIONS ELAPSED_TIME SQL_TEXT
- --------------- ---------- ------------ --------------------------------------------------------
- 3xkp7fqng4wg2          42    123456789 SELECT * FROM ORDERS@MI_DBLINK WHERE ...
-
-[7] Long operations con referencia remota (11g+)
-  no rows selected
-
-[8] Estadisticas de sesion relacionadas con red (11g+)
-  SID=143  bytes received via SQL*Net from dblink    8192
-  SID=143  bytes sent via SQL*Net to dblink          1024
-  SID=143  SQL*Net roundtrips to/from dblink           10
-
-[9] Real-Time SQL Monitoring - sentencias con DBLink (19c)
-  NOTA: requiere licencia Oracle Tuning Pack.
-  SQL_ID=3xkp7fqng4wg2  status=DONE  elapsed=5.218s  cpu=0.031s  buf_gets=42  disk_rd=0
-    SELECT * FROM ORDERS@MI_DBLINK WHERE ...
-
-==================================================
-FIN DBLINK LATENCY TEST
-==================================================
-```
-
-> **Interpretación:** la diferencia entre `100 llamadas locales` y `100 llamadas remotas` muestra el overhead de red por roundtrip. Un ratio > 10x señala latencia de red significativa o SDU de DBLink mal configurado.
-
----
-
-# Resultados entregados
-
-Se entrega el directorio completo de resultados comprimido para su análisis.
-
-## Paquete entregado
-
-```
-diag_<hostname>_<timestamp>.tar.gz
-```
-
-## Contenido del paquete
-
-El `.tar.gz` contiene al menos los siguientes archivos:
-
-| Archivo | Qué contiene |
+| Columna | Descripcion |
 |---|---|
-| `SUMMARY.txt` | Resumen ejecutivo: ping, tnsping, oratcptest |
-| `10_ping_dbhost.txt` | Latencia y pérdida de paquetes ICMP |
-| `11_traceroute_db_tcp.txt` o `11_tracepath_db.txt` | Ruta de red al host Oracle |
-| `12_mtr_db_tcp.txt` | Pérdida por salto (si mtr estaba disponible) |
-| `13_mtu_1472.txt` / `14_mtu_1400.txt` | Fragmentación MTU |
-| `15_nc_db_port.txt` | Conectividad TCP al listener |
-| `16_tnsping.txt` | Tiempo de respuesta TNS |
-| `17_sqlplus_connect.txt` | Conectividad SQL*Plus básica |
-| `20_oratcptest_sync.txt` | Latencia Oracle/TCP en modo síncrono |
-| `21_oratcptest_async.txt` | Throughput Oracle/TCP en modo asíncrono |
-| `22_oratcptest_small_payload.txt` | Throughput con payload 8 KB |
-| `23_oratcptest_medium_payload.txt` | Throughput con payload 64 KB |
-| `30_dblink_test.txt` | Latencia funcional del DBLink (secciones 1–9) |
-| `*.pcap` | Capturas TCP de oratcptest y del listener Oracle |
+| `target_name` | Nombre del path en reportes, por ejemplo `SCL` o `VLP`. |
+| `dest_host` / `dest_oratcp_port` | Host y puerto donde corre `01_oratcp_server.sh`. |
+| `db_host` / `db_port` | Listener Oracle real usado para red, TCP y pcaps. |
+| `tns_alias` | Alias TNS local para `tnsping` y `sqlplus -L /@ALIAS`. |
+| `dblink_name` | DBLink que se consulta con `dual@DBLINK`. |
+| `db_version` | `10g`, `11g` o `19c`. |
+| `iface` | Interfaz para `tcpdump`, por ejemplo `any`, `eth0` o `ens3`. |
+| `capture_seconds` | Ventana adicional de captura despues de las pruebas. |
+| `capture_mode` | `app`, `failover`, `both` o `none`. Para HA usa `both`. |
+
+## Ejecucion
+
+### 1. Iniciar `oratcptest` en cada destino
+
+En cada host destino declarado en el CSV:
+
+```bash
+./01_oratcp_server.sh 4711 ./oratcptest.jar ./oratcp_server_logs
+```
+
+Dejalo corriendo durante la recoleccion. El log incluye `date -Ins`, `timedatectl`, `chronyc` y `ntpq` cuando estan disponibles.
+
+### 2. Ejecutar todos los paths
+
+Desde el host cliente Oracle:
+
+```bash
+./06_run_targets.sh targets.csv diag_paths_HAB
+```
+
+El wrapper ejecuta cada fila del CSV, crea un subdirectorio por target y produce:
+
+| Salida | Contenido |
+|---|---|
+| `diag_paths_HAB/SCL/` | Evidencia completa del path `SCL`. |
+| `diag_paths_HAB/VLP/` | Evidencia completa del path `VLP`. |
+| `diag_paths_HAB/comparison.csv` | Comparacion machine-readable. |
+| `diag_paths_HAB/comparison.md` | Comparacion para revision de ingenieria. |
+| `diag_paths_HAB/run_targets.log` | Log del wrapper. |
+
+Dentro de cada target veras `SUMMARY.txt`, `metrics.env`, `metrics.csv`, pcaps, salida de cada prueba y `path_evidence/` con snapshots before/after por test.
+
+### 3. Medir failover o switchover
+
+Antes de forzar el evento, inicia el watcher en una terminal separada. Usa un `--outdir` dentro del output root para que el reporte consolidado pueda encontrarlo:
+
+```bash
+./05_failover_watch.sh \
+  --tns-alias EXPLDB_SCL \
+  --dblink MI_DBLINK_SCL \
+  --db-host 10.10.10.20 \
+  --db-port 1521 \
+  --interval 2 \
+  --duration 900 \
+  --outdir diag_paths_HAB/failover_SCL
+```
+
+El watcher registra:
+
+- `failover_watch_YYYYMMDD_HHMMSS.csv`: `timestamp`, `iteration`, `probe`, `status`, `elapsed_ms`, `error_text`;
+- `failover_watch_YYYYMMDD_HHMMSS.log`: lectura humana del mismo loop;
+- `time_sync_evidence_YYYYMMDD_HHMMSS.txt`: evidencia de reloj local.
+
+Despues del evento, refresca la comparacion sin repetir las pruebas base:
+
+```bash
+./06_run_targets.sh --report-only diag_paths_HAB
+```
+
+El `comparison.md` incluira un resumen de archivos `failover_watch_*.csv`, primera falla y primera recuperacion observada.
+
+## DBLink
+
+`03_dblink_latency_test.sql` se ejecuta desde el runner y trabaja sobre la sesion SQL*Plus exacta del test:
+
+- captura y muestra `SID` y `SERIAL#`;
+- marca la sesion con `DBMS_APPLICATION_INFO` (`MODULE=HAB_DBLINK_PATH_DIAG`) y cambia `ACTION` por sub-test;
+- separa `single-row remote roundtrip`, `multi-row remote fetch` y `sustained repeated remote calls`;
+- toma snapshots before/after de `v$sesstat` para bytes enviados, bytes recibidos y roundtrips DBLink;
+- emite lineas `DBLINK_METRIC|...|...` que alimentan el reporte consolidado;
+- consulta waits DBLink/SQL*Net solamente para el `SID/SERIAL#` capturado.
+
+## Capturas
+
+El runner crea capturas separadas cuando `capture_mode=both`:
+
+- `oratcptest_HOST_PORT.pcap`: trafico del benchmark Oracle/TCP;
+- `oracle_HOST_PORT.pcap`: trafico Oracle real hacia el listener;
+- `failover_connectivity_TARGET.pcap`: ARP, ICMP y TCP relevante para failover.
+
+Analisis manual:
+
+```bash
+./04_analyze_pcap.sh --pcap diag_paths_HAB/SCL/oracle_10.10.10.20_1521.pcap --port 1521 --mode app --host 10.10.10.20
+./04_analyze_pcap.sh --pcap diag_paths_HAB/SCL/failover_connectivity_SCL.pcap --port 1521 --mode failover --host 10.10.10.20
+```
+
+El modo `failover` busca ARP, ICMP unreachable, SYN/FIN/RST, resets, retransmisiones, perdida, out-of-order y pistas de silent drop.
+
+## Como leer la comparacion
+
+Revisa primero `comparison.md`. Las columnas principales son:
+
+- `Route dev`, `Via`, `Src`: decision local de routing hacia el `db_host`;
+- `Ping loss %`, `Ping avg ms`, `TNS ms`: latencia basica por path;
+- `DBLink single/fetch/repeated ms`: costo funcional por sub-test DBLink;
+- `DB retr` y `Failover retr`: retransmisiones observadas con `tshark` cuando esta instalado;
+- `Output`: carpeta con evidencia completa.
+
+Para probar que el trafico sigue usando Santiago o que ya distribuye entre Santiago y Valparaiso, compara `route_dev`, `route_via`, `route_src`, traceroute/mtr, pcaps y los snapshots en `path_evidence/`.
+
+## Lo que este kit no valida por si solo
+
+Este kit observa lo que el host Linux/Oracle cliente puede medir. No rediseña ni confirma por si solo decisiones de red de Cirion, Ascenty u OCI. En particular quedan fuera:
+
+- decision de topologia HA active-active, active-passive o failover automatico;
+- cambios de ruteo en Cirion, OCI o Ascenty;
+- cambio de mascara de interconexion de `/30` a `/29`;
+- implementacion de HSRP en ASR920;
+- confirmacion de comunicacion inter-site entre data centers;
+- preferencia de ruta o politicas BGP fuera del host cliente.
+
+## Checklist manual para red
+
+Pide al equipo de red evidencia para cada data center y para el momento de failover:
+
+- tablas de ruta y rutas efectivas hacia las IPs Oracle y `oratcptest`;
+- estado BGP, vecinos, prefijos anunciados/recibidos y cambios durante el evento;
+- estado HSRP/VRRP si aplica, incluyendo active/standby y timers;
+- estado de interfaces, VLANs, subinterfaces y cross-connects;
+- errores, drops, discards y counters before/after en ASR920, Cirion, Ascenty y OCI;
+- evidencia de preferencia de link o policy routing;
+- ARP/MAC tables para los endpoints relevantes;
+- confirmacion explicita de si existe comunicacion inter-site para HA;
+- confirmacion de que la configuracion pendiente del lado Ascenty fue aplicada antes de esperar trafico por VLP.
+
+La revision final debe cruzar esa evidencia de red con `comparison.md`, `path_evidence/`, pcaps y `failover_watch_*.csv`.

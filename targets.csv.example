@@ -1,0 +1,4 @@
+# target_name,dest_host,dest_oratcp_port,db_host,db_port,tns_alias,dblink_name,db_version,iface,capture_seconds,capture_mode
+# Complete estos valores con las IPs/aliases reales antes de ejecutar 06_run_targets.sh.
+SCL,10.10.10.20,4711,10.10.10.20,1521,EXPLDB_SCL,MI_DBLINK_SCL,19c,any,90,both
+VLP,10.20.10.20,4711,10.20.10.20,1521,EXPLDB_VLP,MI_DBLINK_VLP,19c,any,90,both
