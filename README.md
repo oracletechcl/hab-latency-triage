@@ -495,4 +495,3 @@ El `.tar.gz` contiene al menos los siguientes archivos:
 | `23_oratcptest_medium_payload.txt` | Throughput con payload 64 KB |
 | `30_dblink_test.txt` | Latencia funcional del DBLink (secciones 1–9) |
 | `*.pcap` | Capturas TCP de oratcptest y del listener Oracle |
-
